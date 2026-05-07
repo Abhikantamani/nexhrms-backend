@@ -1,0 +1,15 @@
+cd C:\nexhrms_bot
+
+@"
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+"@ | Out-File -FilePath .gitignore -Encoding utf8
+
+git add .gitignore
+git commit -m "Add gitignore - exclude venv and pycache"
+git push origin main
