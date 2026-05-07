@@ -408,8 +408,278 @@ export default function HrmsChatbot() {
   const recognitionRef = useRef(null);
   const transcriptRef  = useRef('');
 
-  // Role is set ONCE at start — locked until New Chat
-  const [role,            setRole]            = useState(null); // null = show role picker
+  // Auth state — 'login' | 'role' | 'chat'
+  const [authStep,        setAuthStep]        = useState('login');
+  const [loggedInUser,    setLoggedInUser]     = useState(null);
+
+  // Chat state
+  const [role,            setRole]            = useState(null);
+  const [userName,        setUserName]        = useState('');
+  const [language,        setLanguage]        = useState('en');
+  const [messages,        setMessages]        = useState([]);
+  const [input,           setInput]           = useState('');
+  const [isLoading,       setIsLoading]       = useState(false);
+  const [convState,       setConvState]       = useState('IDLE');
+  const [convData,        setConvData]        = useState({});
+  const [convHistory,     setConvHistory]     = useState([]);
+  const [isListening,     setIsListening]     = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const [speechError,     setSpeechError]     = useState('');
+
+  const t        = TRANSLATIONS[language];
+  const roleInfo = ROLES.find(r => r.id === role);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isLoading]);
+
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setSpeechSupported(false); return; }
+    const recognition          = new SR();
+    recognition.continuous     = false;
+    recognition.interimResults = true;
+    recognition.onstart  = () => { transcriptRef.current = ''; setSpeechError(''); setIsListening(true); };
+    recognition.onresult = (e) => {
+      const tr = Array.from(e.results).map(r => r[0]?.transcript || '').join(' ').trim();
+      transcriptRef.current = tr;
+      setInput(tr);
+    };
+    recognition.onerror = (e) => {
+      const errs = { 'not-allowed': 'Microphone access blocked.', 'no-speech': 'No speech detected.' };
+      setSpeechError(errs[e.error] || 'Voice input failed.');
+      setIsListening(false);
+    };
+    recognition.onend = () => { setIsListening(false); if (transcriptRef.current) inputRef.current?.focus(); };
+    recognitionRef.current = recognition;
+    setSpeechSupported(true);
+    return () => recognition.stop();
+  }, []);
+
+  useEffect(() => {
+    if (recognitionRef.current) recognitionRef.current.lang = LANG_SPEECH[language] || 'en-IN';
+  }, [language]);
+
+  // ── Handle successful login ──
+  const handleLogin = (userData) => {
+    setLoggedInUser(userData);
+    setRole(userData.role);
+    setUserName(userData.name || '');
+    const welcomeData = userData.emp_id ? { name: userData.name, emp_id: userData.emp_id } : {};
+    setConvData(welcomeData);
+    const welcomeFn = ROLE_WELCOME[userData.role];
+    const welcomeMsg = typeof welcomeFn === 'function' ? welcomeFn(userData.name) : welcomeFn;
+    setMessages([{ sender: 'bot', text: welcomeMsg }]);
+    setAuthStep('chat');
+  };
+
+  // ── Skip login → role picker ──
+  const handleSkipLogin = () => setAuthStep('role');
+
+  // ── Role selected without login ──
+  const handleRoleSelect = (selectedRole) => {
+    setRole(selectedRole);
+    setUserName('');
+    const welcomeFn = ROLE_WELCOME[selectedRole];
+    const welcomeMsg = typeof welcomeFn === 'function' ? welcomeFn('') : welcomeFn;
+    setMessages([{ sender: 'bot', text: welcomeMsg }]);
+    setAuthStep('chat');
+  };
+
+  // ── Logout / New Chat ──
+  const handleReset = () => {
+    sessionId.current = generateSessionId();
+    setAuthStep('login');
+    setLoggedInUser(null);
+    setRole(null);
+    setUserName('');
+    setConvState('IDLE');
+    setConvData({});
+    setConvHistory([]);
+    setInput('');
+    setSpeechError('');
+    setIsListening(false);
+    setMessages([]);
+    recognitionRef.current?.stop();
+  };
+
+  const toggleVoice = () => {
+    if (!recognitionRef.current || isLoading) return;
+    if (isListening) { recognitionRef.current.stop(); return; }
+    transcriptRef.current = ''; setInput(''); setSpeechError('');
+    recognitionRef.current.start();
+  };
+
+  const send = async (text) => {
+    const trimmed = (text || input).trim();
+    if (!trimmed || isLoading) return;
+    setMessages(prev => [...prev, { sender: 'user', text: trimmed }]);
+    setInput('');
+    setSpeechError('');
+    setIsLoading(true);
+    const updatedHistory = [...convHistory, { role: 'user', content: trimmed }];
+    try {
+      const res = await fetch(`${BACKEND_URL}/chat`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message:  trimmed,
+          user_id:  sessionId.current,
+          role:     role,
+          state:    convState,
+          data:     convData,
+          history:  updatedHistory,
+          language: language,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result   = await res.json();
+      const botReply = result.response || 'I am having trouble responding. Please try again.';
+      setConvState(result.state || 'IDLE');
+      setConvData(result.data   || {});
+      setConvHistory([...updatedHistory, { role: 'assistant', content: botReply }]);
+      setMessages(prev => [...prev, { sender: 'bot', text: botReply }]);
+    } catch (err) {
+      console.error(err);
+      setMessages(prev => [...prev, { sender: 'bot', text: "I'm having trouble connecting. Please try again." }]);
+    } finally {
+      setIsLoading(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  // ── Render correct screen ──
+  if (authStep === 'login') return <LoginScreen onLogin={handleLogin} onSkip={handleSkipLogin} />;
+  if (authStep === 'role')  return <RoleSelect onSelect={handleRoleSelect} />;
+
+  const showChips = messages.length <= 2 && !isLoading;
+
+  return (
+    <div className="flex flex-col h-[680px] bg-slate-50 rounded-3xl overflow-hidden shadow-2xl border border-slate-200">
+
+      {/* ── Header ── */}
+      <div className="bg-gradient-to-r from-indigo-700 to-indigo-500 px-5 py-3 shadow-md">
+        <div className="flex items-center justify-between mb-2">
+          <a href="https://futureinvo.com" target="_blank" rel="noreferrer"
+            className="text-xs font-semibold text-indigo-100 tracking-widest uppercase hover:text-white transition">
+            🌐 {COMPANY_NAME}
+          </a>
+          <div className="flex items-center gap-2">
+            <div className="flex gap-0.5 bg-white/15 rounded-full p-0.5">
+              {['en', 'hi', 'te', 'ta'].map(lang => (
+                <button key={lang} onClick={() => setLanguage(lang)}
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full transition ${
+                    language === lang ? 'bg-white text-indigo-700' : 'text-indigo-100 hover:text-white'
+                  }`}>
+                  {LANG_LABELS[lang]}
+                </button>
+              ))}
+            </div>
+            <button onClick={handleReset}
+              className="text-xs text-indigo-200 hover:text-white transition px-2 py-1 rounded-full hover:bg-white/10 font-medium">
+              {loggedInUser ? 'Logout' : t.newChat}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-full bg-white/20 border-2 border-white/40 flex items-center justify-center flex-shrink-0 text-lg">
+            {roleInfo?.emoji}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-bold text-white">
+                {userName ? userName : `${PRODUCT_NAME} HR Assistant`}
+              </p>
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/20 text-white border border-white/30">
+                {roleInfo?.label}
+              </span>
+              {loggedInUser && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-400/30 text-green-200 border border-green-300/30">
+                  ✓ Logged in
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 bg-green-300 rounded-full animate-pulse" />
+              <p className="text-xs text-indigo-100 font-medium">{t.online}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Messages ── */}
+      <div className="flex-1 overflow-y-auto px-4 pt-4 pb-2">
+        {messages.map((msg, i) => <MessageBubble key={i} msg={msg} />)}
+
+        {showChips && roleInfo && (
+          <div className="flex flex-wrap gap-2 mb-3 ml-10">
+            {roleInfo.chips.map(chip => (
+              <button key={chip} onClick={() => send(chip)}
+                className="text-xs bg-white border border-indigo-200 text-indigo-700 px-3 py-1.5 rounded-full hover:bg-indigo-50 hover:border-indigo-400 transition font-medium shadow-sm">
+                {chip}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {isLoading && (
+          <div className="flex justify-start mb-4">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center mr-2.5 mt-1 flex-shrink-0">
+              <span className="text-white text-xs font-bold">H</span>
+            </div>
+            <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-none px-4 py-3 shadow-sm">
+              <div className="flex gap-1 items-center h-4">
+                {[0, 150, 300].map(d => (
+                  <span key={d} className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce"
+                    style={{ animationDelay: `${d}ms` }} />
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* ── Input ── */}
+      <form onSubmit={(e) => { e.preventDefault(); send(); }} className="px-4 py-3 bg-white border-t border-slate-100">
+        <div className="flex gap-2 items-center">
+          <input ref={inputRef} type="text" value={input}
+            onChange={e => setInput(e.target.value)}
+            placeholder={isListening ? t.listening : t.placeholder}
+            disabled={isLoading}
+            className={`flex-1 px-4 py-2.5 text-sm rounded-full focus:outline-none focus:ring-2 focus:ring-indigo-400 transition disabled:opacity-50 text-slate-800 placeholder-slate-400 ${
+              isListening ? 'bg-red-50 border border-red-200' : 'bg-slate-100 focus:bg-white'
+            }`}
+          />
+          {speechSupported && (
+            <button type="button" onClick={toggleVoice} disabled={isLoading}
+              className={`w-10 h-10 flex-shrink-0 rounded-full flex items-center justify-center transition border ${
+                isListening ? 'bg-red-500 border-red-500 text-white animate-pulse'
+                            : 'bg-white border-indigo-200 text-indigo-600 hover:bg-indigo-50'
+              } disabled:opacity-40`}>
+              <MicIcon />
+            </button>
+          )}
+          <button type="submit" disabled={isLoading || !input.trim()}
+            className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-indigo-700 rounded-full flex items-center justify-center hover:opacity-90 transition disabled:opacity-40 shadow-md flex-shrink-0">
+            <svg className="w-4 h-4 text-white translate-x-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
+            </svg>
+          </button>
+        </div>
+        <div className="mt-1.5 min-h-[14px] text-center text-[10px] text-slate-400">
+          {speechError
+            ? <span className="text-red-500">{speechError}</span>
+            : isListening
+              ? <span className="text-red-500 font-medium">🔴 Listening — speak now</span>
+              : <span>⚠️ AI in beta · responses may not always be accurate · {COMPANY_NAME}</span>
+          }
+        </div>
+      </form>
+    </div>
+  );
+}
   const [language,        setLanguage]        = useState('en');
   const [messages,        setMessages]        = useState([]);
   const [input,           setInput]           = useState('');
