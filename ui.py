@@ -793,11 +793,11 @@ async def chat_endpoint(payload: ChatMessage):
     messages = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in history]
     messages.append({"role": "user", "content": raw_msg})
     
-    # Try models in order (fallback chain) — updated May 2026
+    # Try models in order (fallback chain)
     models_to_try = [
-        "llama-3.3-70b-versatile",   # Current best — use this first
-        "llama-3.1-8b-instant",      # Smaller but still active
-        "llama3-8b-8192",            # Legacy fallback
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "llama3-8b-8192"
     ]
     
     bot_reply = None
@@ -1084,7 +1084,7 @@ class LoginRequest(BaseModel):
     emp_id: str
     password: str
 
-# Default passwords per role — store in env vars for production
+# Role passwords — set via Render env vars or use defaults
 ROLE_PASSWORDS = {
     "hr":      os.environ.get("HR_PASSWORD",      "hr@1234"),
     "manager": os.environ.get("MANAGER_PASSWORD", "mgr@1234"),
@@ -1093,54 +1093,56 @@ ROLE_PASSWORDS = {
 
 @app.post("/api/login")
 async def login(payload: LoginRequest):
-    """
-    Login endpoint.
-    - Employees: use emp_id + password 'emp@1234' (or their custom password)
-    - HR/Manager/Admin: use their role keyword + role password
-    """
-    emp_id    = payload.emp_id.strip()
-    password  = payload.password.strip()
+    emp_id   = payload.emp_id.strip().lower()
+    password = payload.password.strip()
 
-    # Check if it's a role-based login (hr, manager, admin)
-    if emp_id.lower() in ROLE_PASSWORDS:
-        role = emp_id.lower()
-        if password == ROLE_PASSWORDS[role]:
+    if not emp_id or not password:
+        return {"success": False, "message": "Please enter both ID and password."}
+
+    # ── Role login (hr, manager, admin) ──
+    if emp_id in ROLE_PASSWORDS:
+        if password == ROLE_PASSWORDS[emp_id]:
             return {
-                "success": True,
-                "role": role,
-                "name": role.upper(),
-                "emp_id": role,
-                "message": f"Welcome, {role.upper()}!"
+                "success":  True,
+                "role":     emp_id,
+                "name":     emp_id.upper(),
+                "emp_id":   emp_id,
+                "message":  f"Welcome, {emp_id.upper()}!"
             }
         else:
-            return {"success": False, "message": "Incorrect password"}
+            return {"success": False, "message": "Incorrect password. Please try again."}
 
-    # Employee login — look up by emp_id
-    emp = get_employee_by_id(emp_id)
-    if not emp:
-        # Also try searching by name
-        emp = get_employee_by_name(emp_id)
-    
-    if emp:
-        emp_name = emp["name"] if isinstance(emp, dict) else emp.name
-        emp_id_val = emp["emp_id"] if isinstance(emp, dict) else emp.emp_id
-        dept = emp.get("department", "") if isinstance(emp, dict) else emp.department
+    # ── Employee login by emp_id (case-insensitive) ──
+    conn = get_db()
+    c    = conn.cursor()
+    c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(emp_id) = ?', (emp_id,))
+    row = c.fetchone()
 
-        # Default employee password = "emp@1234" or their emp_id lowercase
+    # Also try searching by name if emp_id not found
+    if not row:
+        c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(name) = ?', (emp_id,))
+        row = c.fetchone()
+
+    conn.close()
+
+    if row:
+        emp_id_val, name, dept, designation = row
+        # Default password is emp@1234 or their emp_id lowercase
         valid_passwords = ["emp@1234", emp_id_val.lower(), "password"]
         if password in valid_passwords:
             return {
-                "success": True,
-                "role": "employee",
-                "name": emp_name,
-                "emp_id": emp_id_val,
-                "department": dept,
-                "message": f"Welcome back, {emp_name}!"
+                "success":     True,
+                "role":        "employee",
+                "name":        name,
+                "emp_id":      emp_id_val,
+                "department":  dept,
+                "designation": designation,
+                "message":     f"Welcome back, {name}!"
             }
         else:
-            return {"success": False, "message": "Incorrect password"}
+            return {"success": False, "message": "Incorrect password. Default password is emp@1234"}
     
-    return {"success": False, "message": "Employee not found. Check your ID or name."}
+    return {"success": False, "message": "Employee not found. Check your ID or contact HR."}
 
 
 print(f"\n{'='*60}")
