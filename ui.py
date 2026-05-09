@@ -740,7 +740,26 @@ def mark_attendance_for(emp: dict, data: dict = None):
     backup_database_to_cloud()
     data.update({"attendance_marked": True, "emp_id": emp["emp_id"], "name": emp["name"]})
 
-def approve_latest_leave(query: str):
+def reject_latest_leave(query: str):
+    target = clean_name(query)
+    conn = get_db()
+    c = conn.cursor()
+    if target:
+        c.execute('''UPDATE leaves SET status='Rejected'
+                    WHERE id = (
+                        SELECT id FROM leaves
+                        WHERE LOWER(emp_name) LIKE ? AND status='Pending'
+                        ORDER BY id DESC LIMIT 1
+                    )''', (f"%{target.lower()}%",))
+    else:
+        c.execute('''UPDATE leaves SET status='Rejected'
+                    WHERE id = (SELECT id FROM leaves WHERE status='Pending' ORDER BY id DESC LIMIT 1)''')
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    if affected:
+        backup_database_to_cloud()
+    return affected > 0
     target = clean_name(query)
     conn = get_db()
     c = conn.cursor()
@@ -785,87 +804,336 @@ def pending_leaves_text():
     return "\n".join(lines)
 
 def handle_direct_action(raw_msg: str, role: str, state: str, data: dict):
+    """
+    State machine for multi-step HR flows.
+    Returns a response dict or None (to fall through to Groq).
+    States:
+      IDLE                 → normal Groq conversation
+      ADD_EMP_NAME         → waiting for employee name
+      ADD_EMP_DEPT         → waiting for department
+      ADD_EMP_DESIG        → waiting for designation
+      ADD_EMP_EMAIL        → waiting for email
+      ADD_EMP_PHONE        → waiting for phone
+      ADD_EMP_CONFIRM      → waiting for YES/NO confirmation
+      LEAVE_TYPE           → waiting for leave type
+      LEAVE_FROM           → waiting for start date
+      LEAVE_TO             → waiting for end date
+      LEAVE_REASON         → waiting for reason
+      LEAVE_CONFIRM        → waiting for YES/NO confirmation
+      APPROVE_WHO          → waiting for employee name to approve
+      APPROVE_CONFIRM      → waiting for YES/NO to approve
+    """
     low = raw_msg.lower().strip()
+    yes = low in ["yes", "y", "confirm", "ok", "sure", "proceed", "haan", "ha"]
+    no  = low in ["no", "n", "cancel", "stop", "nahi", "nope"]
 
-    if any(phrase in low for phrase in ["show all employees", "view all employees", "list employees", "show employees", "view employees"]):
+    # ── SIMPLE READS (no state machine needed) ────────────────────
+    if any(p in low for p in ["show all employees", "list employees", "view all employees", "show employees"]):
         return {"response": list_employees_text(), "state": "IDLE", "data": data}
 
-    if any(phrase in low for phrase in ["pending leave", "leave requests", "show leaves", "view leaves"]):
+    if any(p in low for p in ["pending leave", "leave requests", "show leaves", "view leaves", "pending requests"]):
         if role not in {"manager", "hr", "admin"}:
-            return {"response": "Pending leave requests are visible only to Manager, HR, or Admin roles.", "state": "IDLE", "data": data}
+            return {"response": "Only Manager, HR, or Admin can view leave requests.", "state": "IDLE", "data": data}
         return {"response": pending_leaves_text(), "state": "IDLE", "data": data}
 
-    if ("approve" in low and "leave" in low) or state == "APPROVE_LEAVE":
-        if role not in {"manager", "hr", "admin"}:
-            return {"response": "Only Manager, HR, or Admin can approve leave requests.", "state": "IDLE", "data": data}
-        ok = approve_latest_leave(raw_msg)
-        return {"response": "Leave request approved." if ok else "I could not find a pending leave request to approve.", "state": "IDLE", "data": data}
+    # ── CANCEL anytime ────────────────────────────────────────────
+    if no and state not in ["IDLE"]:
+        data = {}
+        return {"response": "❌ Cancelled. What else can I help you with?", "state": "IDLE", "data": data}
 
-    wants_add = ((("add" in low or "create" in low) and "employee" in low) or state == "ADD_EMPLOYEE_DETAILS")
-    if wants_add:
+    # ══════════════════════════════════════════════════════════════
+    # FLOW 1: ADD EMPLOYEE
+    # ══════════════════════════════════════════════════════════════
+
+    # Trigger: detect add employee intent
+    if state == "IDLE" and ("add" in low or "create" in low or "new" in low) and "employee" in low:
         if role not in {"hr", "admin"}:
-            return {"response": "Only HR or Admin can add employees. Please switch to HR/Admin role.", "state": "IDLE", "data": data}
-        if state == "ADD_EMPLOYEE_DETAILS" and "," in raw_msg:
-            parts = [p.strip() for p in raw_msg.split(",")]
-            name = clean_name(parts[0])
-            dept = parts[1].title() if len(parts) > 1 else "General"
-            designation = parts[2].title() if len(parts) > 2 else "Employee"
+            return {"response": "⛔ Only HR or Admin can add employees.", "state": "IDLE", "data": data}
+        return {
+            "response": "Sure! Let's add a new employee step by step. 📝\n\nFirst, what is the **full name** of the new employee?",
+            "state": "ADD_EMP_NAME",
+            "data": {}
+        }
+
+    if state == "ADD_EMP_NAME":
+        name = raw_msg.strip().title()
+        if len(name) < 2:
+            return {"response": "Please enter a valid full name (at least 2 characters).", "state": "ADD_EMP_NAME", "data": data}
+        data["name"] = name
+        return {
+            "response": f"Got it — **{name}**. 👍\n\nWhich **department** will {name} be joining?\n\nOptions: IT · HR · Finance · Marketing · Operations · Sales · Admin · Other",
+            "state": "ADD_EMP_DEPT",
+            "data": data
+        }
+
+    if state == "ADD_EMP_DEPT":
+        dept = raw_msg.strip().title()
+        if len(dept) < 2:
+            return {"response": "Please enter a valid department name.", "state": "ADD_EMP_DEPT", "data": data}
+        data["department"] = dept
+        return {
+            "response": f"Department: **{dept}** ✅\n\nWhat is **{data['name']}'s** job title / designation?\n\nExamples: Software Developer · HR Executive · Accountant · Marketing Manager",
+            "state": "ADD_EMP_DESIG",
+            "data": data
+        }
+
+    if state == "ADD_EMP_DESIG":
+        desig = raw_msg.strip().title()
+        if len(desig) < 2:
+            return {"response": "Please enter a valid designation.", "state": "ADD_EMP_DESIG", "data": data}
+        data["designation"] = desig
+        return {
+            "response": f"Designation: **{desig}** ✅\n\nWhat is **{data['name']}'s** email address?\n_(Type **skip** to add later)_",
+            "state": "ADD_EMP_EMAIL",
+            "data": data
+        }
+
+    if state == "ADD_EMP_EMAIL":
+        email = "" if low in ["skip", "none", "-", "no"] else raw_msg.strip()
+        data["email"] = email
+        return {
+            "response": f"{'Email: **' + email + '** ✅' if email else 'Email skipped.'}\n\nWhat is **{data['name']}'s** phone number?\n_(Type **skip** to add later)_",
+            "state": "ADD_EMP_PHONE",
+            "data": data
+        }
+
+    if state == "ADD_EMP_PHONE":
+        phone = "" if low in ["skip", "none", "-", "no"] else raw_msg.strip()
+        data["phone"] = phone
+        name  = data.get("name", "")
+        dept  = data.get("department", "")
+        desig = data.get("designation", "")
+        email = data.get("email", "") or "Not provided"
+        return {
+            "response": (
+                f"Please confirm the details below:\n\n"
+                f"👤 **Name:** {name}\n"
+                f"🏢 **Department:** {dept}\n"
+                f"💼 **Designation:** {desig}\n"
+                f"📧 **Email:** {email}\n"
+                f"📱 **Phone:** {phone or 'Not provided'}\n\n"
+                f"Type **YES** to add this employee or **NO** to cancel."
+            ),
+            "state": "ADD_EMP_CONFIRM",
+            "data": data
+        }
+
+    if state == "ADD_EMP_CONFIRM":
+        if yes:
+            name  = data.get("name", "Unknown")
+            dept  = data.get("department", "General")
+            desig = data.get("designation", "Employee")
+            email = data.get("email", "")
+            phone = data.get("phone", "")
+            emp, error = create_employee_record(name, dept, desig)
+            if not emp:
+                return {"response": f"❌ Could not add employee: {error}", "state": "IDLE", "data": {}}
+            # Update email and phone in DB
+            if email or phone:
+                try:
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute('UPDATE employees SET email=?, phone=? WHERE emp_id=?', (email, phone, emp["emp_id"]))
+                    conn.commit()
+                    conn.close()
+                except: pass
+            data.update({"employee_added": True, "emp_id": emp["emp_id"], "name": emp["name"]})
+            return {
+                "response": (
+                    f"✅ **{name}** has been added successfully!\n\n"
+                    f"🆔 **Employee ID:** `{emp['emp_id']}`\n"
+                    f"🏢 **Department:** {dept}\n"
+                    f"💼 **Designation:** {desig}\n\n"
+                    f"Their default login password is **emp@1234**\n"
+                    f"They can login using: `{emp['emp_id']}` / `emp@1234`"
+                ),
+                "state": "IDLE",
+                "data": data
+            }
         else:
-            name, dept, designation = extract_employee_details(raw_msg, data)
-        if not name:
-            return {
-                "response": "Sure. Please send the employee details in this format:\n`Name, Department, Designation`\nExample: `Rahul Sharma, IT, Developer`",
-                "state": "ADD_EMPLOYEE_DETAILS",
-                "data": data,
-            }
-        emp, error = create_employee_record(name, dept, designation)
-        if not emp:
-            return {"response": error or "I could not add the employee. Please check the name and try again.", "state": "IDLE", "data": data}
-        data.update({"employee_added": True, "emp_id": emp["emp_id"], "name": emp["name"]})
+            return {"response": "❌ Cancelled. Type 'add employee' to start again.", "state": "IDLE", "data": {}}
+
+    # ══════════════════════════════════════════════════════════════
+    # FLOW 2: APPLY LEAVE
+    # ══════════════════════════════════════════════════════════════
+
+    if state == "IDLE" and "leave" in low and any(w in low for w in ["apply", "request", "need", "want", "take"]):
         return {
-            "response": f"Employee added successfully.\n\n**Name:** {emp['name']}\n**Employee ID:** `{emp['emp_id']}`\n**Department:** {emp['department']}\n**Designation:** {emp['designation']}\n\nYou can now search by name in ESS/MSS.",
-            "state": "IDLE",
-            "data": data,
+            "response": (
+                "Sure! Let's apply for leave. 📋\n\n"
+                "What **type of leave** would you like?\n\n"
+                "1️⃣ Casual Leave _(12 days/year)_\n"
+                "2️⃣ Sick Leave _(10 days/year)_\n"
+                "3️⃣ Earned Leave _(15 days/year)_\n"
+                "4️⃣ Maternity Leave _(180 days)_\n"
+                "5️⃣ Paternity Leave _(15 days)_\n\n"
+                "Type the name or number."
+            ),
+            "state": "LEAVE_TYPE",
+            "data": {}
         }
 
-    wants_leave = (("leave" in low and any(w in low for w in ["apply", "request", "need", "want"])) or state in {"LEAVE_EMPLOYEE", "LEAVE_DETAILS"})
-    if wants_leave:
-        emp = resolve_employee(raw_msg, data)
-        if not emp:
-            return {
-                "response": "Who is applying for leave? Please type the employee name or ID. Example: `Rahul Sharma`",
-                "state": "LEAVE_EMPLOYEE",
-                "data": data,
-            }
-        data.update({"emp_id": emp["emp_id"], "name": emp["name"]})
-        leave_type, days, from_date, to_date = extract_leave_details(raw_msg)
-        if state == "LEAVE_EMPLOYEE" or (from_date == "TBD" and to_date == "TBD" and "tomorrow" not in low and "today" not in low):
-            return {
-                "response": f"Got it, leave is for **{emp['name']}**. Please send leave details like:\n`Sick leave from 10 May to 12 May for 3 days`",
-                "state": "LEAVE_DETAILS",
-                "data": data,
-            }
-        leave_id = create_leave_request(emp, leave_type, days, from_date, to_date)
-        data.update({"leave_applied": True, "leave_id": leave_id})
+    if state == "LEAVE_TYPE":
+        leave_map = {
+            "1": "Casual Leave", "casual": "Casual Leave",
+            "2": "Sick Leave",   "sick":   "Sick Leave",
+            "3": "Earned Leave", "earned": "Earned Leave",
+            "4": "Maternity Leave", "maternity": "Maternity Leave",
+            "5": "Paternity Leave", "paternity": "Paternity Leave",
+        }
+        leave_type = None
+        for key, val in leave_map.items():
+            if key in low:
+                leave_type = val
+                break
+        if not leave_type:
+            return {"response": "Please choose a valid leave type: Casual, Sick, Earned, Maternity, or Paternity.", "state": "LEAVE_TYPE", "data": data}
+        data["leave_type"] = leave_type
         return {
-            "response": f"Leave request submitted.\n\n**Request ID:** `{leave_id}`\n**Employee:** {emp['name']}\n**Type:** {leave_type}\n**Days:** {days}\n**Dates:** {from_date} to {to_date}\n**Status:** Pending manager approval",
-            "state": "IDLE",
-            "data": data,
+            "response": f"**{leave_type}** selected ✅\n\nWhat is the **start date** of your leave?\n_Example: 15 May 2026_",
+            "state": "LEAVE_FROM",
+            "data": data
         }
 
-    if "attendance" in low and any(w in low for w in ["mark", "check in", "present"]):
-        emp = resolve_employee(raw_msg, data)
-        if not emp:
-            return {"response": "Whose attendance should I mark? Type the employee name or ID.", "state": "ATTENDANCE_EMPLOYEE", "data": data}
-        mark_attendance_for(emp, data)
-        return {"response": f"Attendance marked for **{emp['name']}** today.", "state": "IDLE", "data": data}
+    if state == "LEAVE_FROM":
+        from_date = raw_msg.strip()
+        if len(from_date) < 3:
+            return {"response": "Please enter a valid start date. Example: 15 May 2026", "state": "LEAVE_FROM", "data": data}
+        data["from_date"] = from_date
+        return {
+            "response": f"Start date: **{from_date}** ✅\n\nWhat is the **end date** of your leave?\n_Example: 17 May 2026_",
+            "state": "LEAVE_TO",
+            "data": data
+        }
 
-    if state == "ATTENDANCE_EMPLOYEE":
+    if state == "LEAVE_TO":
+        to_date = raw_msg.strip()
+        if len(to_date) < 3:
+            return {"response": "Please enter a valid end date. Example: 17 May 2026", "state": "LEAVE_TO", "data": data}
+        data["to_date"] = to_date
+        return {
+            "response": f"End date: **{to_date}** ✅\n\nWhat is the **reason** for your leave?\n_Example: Family function, Medical appointment, Personal work_",
+            "state": "LEAVE_REASON",
+            "data": data
+        }
+
+    if state == "LEAVE_REASON":
+        reason = raw_msg.strip()
+        data["reason"] = reason
+        leave_type = data.get("leave_type", "Casual Leave")
+        from_date  = data.get("from_date", "")
+        to_date    = data.get("to_date", "")
+        return {
+            "response": (
+                f"Please confirm your leave request:\n\n"
+                f"📋 **Type:** {leave_type}\n"
+                f"📅 **From:** {from_date}\n"
+                f"📅 **To:** {to_date}\n"
+                f"📝 **Reason:** {reason}\n\n"
+                f"Type **YES** to submit or **NO** to cancel."
+            ),
+            "state": "LEAVE_CONFIRM",
+            "data": data
+        }
+
+    if state == "LEAVE_CONFIRM":
+        if yes:
+            emp = resolve_employee("", data)
+            if not emp:
+                return {"response": "Could not find your employee record. Please contact HR.", "state": "IDLE", "data": {}}
+            leave_type = data.get("leave_type", "Casual Leave")
+            from_date  = data.get("from_date", "")
+            to_date    = data.get("to_date", "")
+            reason     = data.get("reason", "Personal")
+            leave_id   = create_leave_request(emp, leave_type, 1, from_date, to_date)
+            return {
+                "response": (
+                    f"✅ Leave request submitted!\n\n"
+                    f"🆔 **Request ID:** `{leave_id}`\n"
+                    f"📋 **Type:** {leave_type}\n"
+                    f"📅 **From:** {from_date} → **To:** {to_date}\n"
+                    f"📝 **Reason:** {reason}\n"
+                    f"⏳ **Status:** Pending manager approval"
+                ),
+                "state": "IDLE",
+                "data": data
+            }
+        else:
+            return {"response": "❌ Leave request cancelled.", "state": "IDLE", "data": {}}
+
+    # ══════════════════════════════════════════════════════════════
+    # FLOW 3: APPROVE/REJECT LEAVE
+    # ══════════════════════════════════════════════════════════════
+
+    if state == "IDLE" and ("approve" in low or "reject" in low) and "leave" in low:
+        if role not in {"manager", "hr", "admin"}:
+            return {"response": "⛔ Only Manager, HR, or Admin can approve/reject leaves.", "state": "IDLE", "data": data}
+        pending = pending_leaves_text()
+        return {
+            "response": f"{pending}\n\nWhich employee's leave would you like to **approve or reject**?\nType the employee name.",
+            "state": "APPROVE_WHO",
+            "data": data
+        }
+
+    if state == "APPROVE_WHO":
+        data["approve_name"] = raw_msg.strip()
+        return {
+            "response": f"Do you want to **APPROVE** or **REJECT** {data['approve_name']}'s leave request?",
+            "state": "APPROVE_ACTION",
+            "data": data
+        }
+
+    if state == "APPROVE_ACTION":
+        if "approve" in low:
+            data["approve_action"] = "approve"
+        elif "reject" in low:
+            data["approve_action"] = "reject"
+        else:
+            return {"response": "Please type **APPROVE** or **REJECT**.", "state": "APPROVE_ACTION", "data": data}
+        action = data["approve_action"]
+        name   = data.get("approve_name", "")
+        return {
+            "response": f"Confirm: You want to **{action.upper()}** {name}'s leave request. Type **YES** or **NO**.",
+            "state": "APPROVE_CONFIRM",
+            "data": data
+        }
+
+    if state == "APPROVE_CONFIRM":
+        if yes:
+            name   = data.get("approve_name", "")
+            action = data.get("approve_action", "approve")
+            if action == "approve":
+                ok = approve_latest_leave(name)
+                msg = f"✅ {name}'s leave has been **approved**." if ok else f"Could not find a pending leave for {name}."
+            else:
+                ok = reject_latest_leave(name)
+                msg = f"❌ {name}'s leave has been **rejected**." if ok else f"Could not find a pending leave for {name}."
+            return {"response": msg, "state": "IDLE", "data": {}}
+        else:
+            return {"response": "Cancelled.", "state": "IDLE", "data": {}}
+
+    # ══════════════════════════════════════════════════════════════
+    # ATTENDANCE MARK
+    # ══════════════════════════════════════════════════════════════
+
+    if state == "IDLE" and "attendance" in low and any(w in low for w in ["mark", "check in", "present", "log"]):
         emp = resolve_employee(raw_msg, data)
         if not emp:
-            return {"response": "I could not find that employee. Please try their full name or EMP ID.", "state": "ATTENDANCE_EMPLOYEE", "data": data}
-        mark_attendance_for(emp, data)
-        return {"response": f"Attendance marked for **{emp['name']}** today.", "state": "IDLE", "data": data}
+            return {"response": "I could not find your employee record. Please contact HR to ensure you're registered.", "state": "IDLE", "data": data}
+        today = datetime.now().strftime("%d %b %Y")
+        return {
+            "response": f"Mark your attendance for today **{today}**?\n\nType **YES** to confirm.",
+            "state": "ATTENDANCE_CONFIRM",
+            "data": {**data, "emp_id": emp["emp_id"], "name": emp["name"]}
+        }
+
+    if state == "ATTENDANCE_CONFIRM":
+        if yes:
+            emp = resolve_employee("", data)
+            if emp:
+                mark_attendance_for(emp, data)
+                return {"response": f"✅ Attendance marked for **{emp['name']}** today at {datetime.now().strftime('%I:%M %p')}.", "state": "IDLE", "data": data}
+        return {"response": "Attendance not marked.", "state": "IDLE", "data": data}
 
     return None
 
