@@ -1179,6 +1179,73 @@ async def debug_database():
         "recent_leaves": leaves,
     }
 
+
+# ── LOGIN ENDPOINT ─────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    emp_id: str
+    password: str
+
+ROLE_PASSWORDS = {
+    "hr":      os.environ.get("HR_PASSWORD",      "hr@1234"),
+    "manager": os.environ.get("MANAGER_PASSWORD", "mgr@1234"),
+    "admin":   os.environ.get("ADMIN_PASSWORD",   "admin@1234"),
+}
+
+@app.post("/api/login")
+async def login_endpoint(payload: LoginRequest):
+    emp_id   = payload.emp_id.strip().lower()
+    password = payload.password.strip()
+
+    if not emp_id or not password:
+        return {"success": False, "message": "Please enter both ID and password."}
+
+    # ── Role login (hr / manager / admin) ──
+    if emp_id in ROLE_PASSWORDS:
+        if password == ROLE_PASSWORDS[emp_id]:
+            return {
+                "success": True,
+                "role":    emp_id,
+                "name":    emp_id.upper(),
+                "emp_id":  emp_id,
+                "message": f"Welcome, {emp_id.upper()}!"
+            }
+        else:
+            return {"success": False, "message": "Incorrect password. Please try again."}
+
+    # ── Employee login — search by emp_id or name ──
+    conn = get_db()
+    c    = conn.cursor()
+
+    # Try emp_id first (case-insensitive)
+    c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(emp_id) = ?', (emp_id,))
+    row = c.fetchone()
+
+    # Try name match if emp_id not found
+    if not row:
+        c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(name) = ?', (emp_id,))
+        row = c.fetchone()
+
+    conn.close()
+
+    if row:
+        emp_id_val, name, dept, designation = row
+        valid_passwords = ["emp@1234", emp_id_val.lower(), "password"]
+        if password in valid_passwords:
+            return {
+                "success":     True,
+                "role":        "employee",
+                "name":        name,
+                "emp_id":      emp_id_val,
+                "department":  dept,
+                "designation": designation,
+                "message":     f"Welcome back, {name}!"
+            }
+        else:
+            return {"success": False, "message": "Incorrect password. Default is emp@1234"}
+
+    return {"success": False, "message": "Not found. Employees: use your EMP ID. HR/Manager/Admin: type your role name."}
+
+
 print(f"\n{'='*60}")
 print(f"✅ {PRODUCT_NAME} HR Assistant is ready")
 print(f"📁 Database: {DB_FILE}")
