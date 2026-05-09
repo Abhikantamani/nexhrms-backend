@@ -106,6 +106,7 @@ def init_database():
         days INTEGER,
         from_date TEXT,
         to_date TEXT,
+        reason TEXT DEFAULT '',
         status TEXT DEFAULT 'Pending',
         applied_on TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
@@ -436,64 +437,118 @@ class ChatMessage(BaseModel):
     language: str = "en"
 
 # ── SYSTEM PROMPT ──────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are the {product} HR Assistant for {company}. You are friendly, simple, and helpful.
+SYSTEM_PROMPT = """You are the {product} HR Assistant for {company}. You are warm, professional, and thorough.
 
 YOUR CURRENT ROLE: {role}
-- If role="employee": Help with THEIR OWN leave, attendance, profile
-- If role="manager": Help manage THEIR TEAM's leaves, attendance, reports
-- If role="hr": Help add employees, generate letters, manage policies
-- If role="admin": Full system access
+- employee → help with THEIR OWN leave, attendance, profile only
+- manager  → help manage THEIR TEAM leaves, attendance, reports
+- hr       → add employees, generate letters, manage policies, records
+- admin    → full access to everything
 
-IDENTITY RULE — CRITICAL:
-If anyone asks "who are you" or "what is your role":
-- ALWAYS answer based on {role} above. NEVER say a different role.
-- employee → "I'm your Personal HR Assistant! I help you with leaves, attendance, and profile."
-- manager → "I'm your Team Manager Assistant! I help you approve leaves and manage your team."
-- hr → "I'm the HR Admin Assistant! I help you add employees, generate letters, and manage records."
-- admin → "I'm the System Administrator! I have full access to all data and reports."
+IDENTITY RULE:
+If asked "who are you" or "what can you do":
+- employee → "I'm your Personal HR Assistant! I help you apply leaves, check balances, and mark attendance."
+- manager  → "I'm your Team Manager Assistant! I help you approve leaves and view your team's attendance."
+- hr       → "I'm the HR Admin Assistant! I help you add employees, generate letters, and manage records."
+- admin    → "I'm the System Administrator with full access to all data and reports."
 
-WHAT YOU CAN DO (by role):
-- employee: Apply leave, check balance, mark attendance, view profile, raise ticket
-- manager: Approve/reject leaves, view team attendance, team reports, pending requests
-- hr: Add employees, generate letters, view all employees, manage policies, records
-- admin: Everything above plus salary reports, all tickets, analytics
+════════════════════════════════════════════════
+STRICT CONVERSATION FLOWS — FOLLOW EXACTLY
+════════════════════════════════════════════════
 
-HOW TO EXTRACT INFORMATION:
-1. For adding employees: Ask Name → Department → Designation → confirm all
-   - CRITICAL: When user says a name, EXTRACT IT immediately. Don't wait.
-   - Ask "Is your name [EXTRACTED_NAME]?" to confirm.
+▶ FLOW 1: ADD EMPLOYEE (HR/Admin only)
+Step 1 → Ask: "What is the full name of the new employee?"
+Step 2 → Ask: "Which department will {name} be joining? (e.g. IT, HR, Finance, Marketing, Operations)"
+Step 3 → Ask: "What is {name}'s designation/job title? (e.g. Software Developer, HR Executive, Accountant)"
+Step 4 → Ask: "What is {name}'s email address? (or type 'skip' to add later)"
+Step 5 → Ask: "What is {name}'s phone number? (or type 'skip' to add later)"
+Step 6 → Show summary and ask: "Please confirm these details:
+  👤 Name: {name}
+  🏢 Department: {dept}
+  💼 Designation: {designation}
+  📧 Email: {email}
+  📱 Phone: {phone}
+  
+  Type YES to confirm and add the employee, or NO to make changes."
+Step 7 → ONLY after user says YES → fire [ACTION:ADD_EMPLOYEE:name|dept|designation|email|phone]
 
-2. For leave: Ask Type → From date → To date → confirm all
+RULE: Do NOT fire ADD_EMPLOYEE until all steps are complete and user confirms YES.
 
-3. For letters:
-   - If employee was just added (you have their emp_id in data) → just ask letter type
-   - If existing employee → ask their name → find them → confirm → ask letter type
+▶ FLOW 2: APPLY LEAVE (Employee only)
+Step 1 → Ask: "What type of leave would you like to apply for?
+  • Casual Leave (12 days/year)
+  • Sick Leave (10 days/year)
+  • Earned Leave (15 days/year)
+  • Maternity Leave (180 days)
+  • Paternity Leave (15 days)"
+Step 2 → Ask: "What is the start date of your leave? (e.g. 15 May 2026)"
+Step 3 → Ask: "What is the end date of your leave? (e.g. 17 May 2026)"
+Step 4 → Calculate days and ask: "What is the reason for your leave?"
+Step 5 → Show summary: "Here's your leave request:
+  📋 Type: {leave_type}
+  📅 From: {from_date}
+  📅 To: {to_date}
+  📆 Total: {days} day(s)
+  📝 Reason: {reason}
+  
+  Type YES to submit or NO to cancel."
+Step 6 → ONLY after YES → fire [ACTION:APPLY_LEAVE:leave_type|from_date|to_date|days|reason]
 
-4. For assets: Ask Employee name → Asset name → confirm
+RULE: Do NOT fire APPLY_LEAVE until all 5 details are collected and user confirms YES.
 
-ACTION TAGS — MUST INCLUDE NAME IN PIPE FORMAT:
-[ACTION:ADD_EMPLOYEE:Rahul Sharma|IT|Developer] ← ALWAYS include name|dept|desig
-[ACTION:APPLY_LEAVE] ← confirm type|dates|days first
-[ACTION:APPROVE_LEAVE:Rahul Sharma] ← include employee name
-[ACTION:GENERATE_LETTER:Offer Letter] ← include letter type
-[ACTION:MARK_ATTENDANCE] ← simple action
-[ACTION:ASSIGN_ASSET:Laptop] ← include asset name
+▶ FLOW 3: APPROVE/REJECT LEAVE (Manager/HR only)
+Step 1 → Show list of pending leaves from database
+Step 2 → Ask: "Which employee's leave would you like to approve or reject?"
+Step 3 → Ask: "Would you like to APPROVE or REJECT this leave request?"
+Step 4 → Ask: "Any comments or reason? (optional — type 'skip' to proceed)"
+Step 5 → Confirm: "You are about to {approve/reject} {name}'s {leave_type} leave. Confirm? YES/NO"
+Step 6 → ONLY after YES → fire [ACTION:APPROVE_LEAVE:name] or [ACTION:REJECT_LEAVE:name]
 
-CRITICAL RULES:
-1. ALWAYS extract the employee's name and confirm it immediately
-2. If name is missing, ask "Who is this for?" right away
-3. For ADD_EMPLOYEE: MUST include name|dept|desig in the action tag
-4. Never approve leaves for employees — only managers and HR can
-5. Only HR and Admin can add employees or generate letters
-6. Keep responses under 100 words
-7. Use **bold** for IDs like **EMP1001**, **LV123**
-8. Tell user what just happened and what to do next
+▶ FLOW 4: GENERATE LETTER (HR/Admin only)
+Step 1 → Ask: "Which employee is this letter for? Please enter their name or Employee ID."
+Step 2 → Look up employee and confirm: "Found: {name} ({emp_id}), {designation} in {dept}. Is this correct? YES/NO"
+Step 3 → Ask: "What type of letter do you need?
+  • Offer Letter
+  • Experience Letter
+  • Relieving Letter
+  • Promotion Letter
+  • Salary Certificate"
+Step 4 → Ask: "Any additional details to include? (e.g. salary, joining date — or type 'skip')"
+Step 5 → Confirm: "Generating {letter_type} for {name}. Confirm? YES/NO"
+Step 6 → ONLY after YES → fire [ACTION:GENERATE_LETTER:letter_type|emp_id]
 
-RESPONSE STYLE:
-- Warm, simple, no jargon
-- Use emojis occasionally (👍 ✅ 😊)
-- Always confirm important info before acting
-- For off-topic: "I help with HR tasks. What HR task can I assist with?"
+▶ FLOW 5: MARK ATTENDANCE (Employee only)
+Step 1 → Confirm: "I'll mark your attendance for today ({today_date}). Confirm? YES/NO"
+Step 2 → ONLY after YES → fire [ACTION:MARK_ATTENDANCE]
+
+▶ FLOW 6: ASSIGN ASSET (HR/Admin only)
+Step 1 → Ask: "Which employee are you assigning this asset to?"
+Step 2 → Ask: "What asset are you assigning? (e.g. Laptop, Mobile Phone, Access Card)"
+Step 3 → Ask: "What is the asset serial number or ID? (or type 'skip')"
+Step 4 → Confirm summary → ONLY after YES → fire [ACTION:ASSIGN_ASSET:asset_name|emp_name]
+
+════════════════════════════════════════════════
+GENERAL RULES
+════════════════════════════════════════════════
+1. NEVER skip steps — always ask one question at a time
+2. NEVER fire an ACTION tag until user explicitly says YES to confirm
+3. If user gives multiple details at once (e.g. "Add Rahul in IT as Developer"), acknowledge them and continue from the next missing step — don't skip confirmation
+4. If a detail is already provided, don't ask for it again — move to next missing step
+5. Never ask more than ONE question per message
+6. Use **bold** for important values like **EMP1001**, **IT**, **Casual Leave**
+7. Always show a clear summary before confirming
+8. Employees cannot approve leaves — only managers and HR
+9. Keep responses clear and friendly — no jargon
+10. For off-topic questions: "I'm here to help with HR tasks only. What would you like to do?"
+
+ACTION TAGS (place silently at end of response, only after YES confirmation):
+[ACTION:ADD_EMPLOYEE:name|dept|designation|email|phone]
+[ACTION:APPLY_LEAVE:leave_type|from_date|to_date|days|reason]
+[ACTION:APPROVE_LEAVE:employee_name]
+[ACTION:REJECT_LEAVE:employee_name]
+[ACTION:GENERATE_LETTER:letter_type|emp_id]
+[ACTION:MARK_ATTENDANCE]
+[ACTION:ASSIGN_ASSET:asset_name|emp_name]
 
 RESPOND ONLY IN {language}. NEVER mix languages."""
 
@@ -570,6 +625,12 @@ def process_action(cmd: str, arg: str, data: dict, role: str, raw_msg: str = "")
         name        = parts[0] if len(parts) > 0 else data.get("name", "Unknown")
         dept        = parts[1] if len(parts) > 1 else data.get("department", "IT")
         designation = parts[2] if len(parts) > 2 else data.get("designation", "Employee")
+        email       = parts[3] if len(parts) > 3 else data.get("email", "")
+        phone       = parts[4] if len(parts) > 4 else data.get("phone", "")
+
+        # Clean skip values
+        email = "" if email.lower() in ["skip", "none", "-"] else email
+        phone = "" if phone.lower() in ["skip", "none", "-"] else phone
         
         if name == "Unknown" or len(name) < 2:
             conn.close()
@@ -578,9 +639,9 @@ def process_action(cmd: str, arg: str, data: dict, role: str, raw_msg: str = "")
         emp_id = get_next_emp_id()
         try:
             c.execute('''INSERT INTO employees 
-                        (emp_id, name, department, designation, status, joining_date, created_at)
-                        VALUES (?, ?, ?, ?, 'Active', ?, ?)''',
-                     (emp_id, name, dept, designation, 
+                        (emp_id, name, department, designation, email, phone, status, joining_date, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'Active', ?, ?)''',
+                     (emp_id, name, dept, designation, email, phone,
                       datetime.now().strftime("%d %b %Y"),
                       datetime.now().strftime("%d %b %Y %I:%M %p")))
             conn.commit()
@@ -589,7 +650,7 @@ def process_action(cmd: str, arg: str, data: dict, role: str, raw_msg: str = "")
             data["emp_id"] = emp_id
             data["name"] = name
             log_activity(name, f"Employee added — {emp_id}")
-            print(f"✅ Added employee: {name} ({emp_id})")
+            print(f"✅ Added employee: {name} ({emp_id}) | {dept} | {designation}")
         except Exception as e:
             print(f"Error adding employee: {e}")
     
@@ -617,6 +678,45 @@ def process_action(cmd: str, arg: str, data: dict, role: str, raw_msg: str = "")
                         print(f"✅ Attendance marked for {emp_name}")
                 except Exception as e:
                     print(f"Error marking attendance: {e}")
+
+    # APPLY_LEAVE — parse leave_type|from_date|to_date|days|reason
+    elif cmd == "APPLY_LEAVE" and not data.get("leave_applied"):
+        parts       = [p.strip() for p in arg.split("|")] if arg else []
+        leave_type  = parts[0] if len(parts) > 0 else data.get("leave_type", "Casual Leave")
+        from_date   = parts[1] if len(parts) > 1 else data.get("from_date", "")
+        to_date     = parts[2] if len(parts) > 2 else data.get("to_date", "")
+        days        = parts[3] if len(parts) > 3 else data.get("days", "1")
+        reason      = parts[4] if len(parts) > 4 else data.get("reason", "Personal")
+        emp_name    = data.get("name", "Employee")
+        emp_id      = data.get("emp_id", "")
+
+        # Clean skip
+        reason = "Personal" if reason.lower() in ["skip", "none", "-"] else reason
+
+        try:
+            days_int = int(days)
+        except:
+            days_int = 1
+
+        try:
+            # Get leave count for ID
+            c.execute('SELECT COUNT(*) FROM leaves')
+            count    = c.fetchone()[0]
+            leave_id = f"LV{count + 1:03d}"
+            c.execute('''INSERT INTO leaves
+                        (leave_id, emp_id, emp_name, leave_type, days, from_date, to_date, reason, status, applied_on)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)''',
+                     (leave_id, emp_id, emp_name, leave_type, days_int,
+                      from_date, to_date, reason,
+                      datetime.now().strftime("%d %b %Y %I:%M %p")))
+            conn.commit()
+            backup_database_to_cloud()
+            data["leave_applied"] = True
+            data["leave_id"]      = leave_id
+            log_activity(emp_name, f"Leave applied — {leave_type} {days_int} days ({from_date} to {to_date})")
+            print(f"✅ Leave applied: {emp_name} | {leave_type} | {days_int} days | {leave_id}")
+        except Exception as e:
+            print(f"Error applying leave: {e}")
     
     conn.close()
 
@@ -1078,72 +1178,6 @@ async def debug_database():
         "recent_employees": employees,
         "recent_leaves": leaves,
     }
-
-# ── LOGIN ENDPOINT ─────────────────────────────────────────────────
-class LoginRequest(BaseModel):
-    emp_id: str
-    password: str
-
-# Role passwords — set via Render env vars or use defaults
-ROLE_PASSWORDS = {
-    "hr":      os.environ.get("HR_PASSWORD",      "hr@1234"),
-    "manager": os.environ.get("MANAGER_PASSWORD", "mgr@1234"),
-    "admin":   os.environ.get("ADMIN_PASSWORD",   "admin@1234"),
-}
-
-@app.post("/api/login")
-async def login(payload: LoginRequest):
-    emp_id   = payload.emp_id.strip().lower()
-    password = payload.password.strip()
-
-    if not emp_id or not password:
-        return {"success": False, "message": "Please enter both ID and password."}
-
-    # ── Role login (hr, manager, admin) ──
-    if emp_id in ROLE_PASSWORDS:
-        if password == ROLE_PASSWORDS[emp_id]:
-            return {
-                "success":  True,
-                "role":     emp_id,
-                "name":     emp_id.upper(),
-                "emp_id":   emp_id,
-                "message":  f"Welcome, {emp_id.upper()}!"
-            }
-        else:
-            return {"success": False, "message": "Incorrect password. Please try again."}
-
-    # ── Employee login by emp_id (case-insensitive) ──
-    conn = get_db()
-    c    = conn.cursor()
-    c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(emp_id) = ?', (emp_id,))
-    row = c.fetchone()
-
-    # Also try searching by name if emp_id not found
-    if not row:
-        c.execute('SELECT emp_id, name, department, designation FROM employees WHERE LOWER(name) = ?', (emp_id,))
-        row = c.fetchone()
-
-    conn.close()
-
-    if row:
-        emp_id_val, name, dept, designation = row
-        # Default password is emp@1234 or their emp_id lowercase
-        valid_passwords = ["emp@1234", emp_id_val.lower(), "password"]
-        if password in valid_passwords:
-            return {
-                "success":     True,
-                "role":        "employee",
-                "name":        name,
-                "emp_id":      emp_id_val,
-                "department":  dept,
-                "designation": designation,
-                "message":     f"Welcome back, {name}!"
-            }
-        else:
-            return {"success": False, "message": "Incorrect password. Default password is emp@1234"}
-    
-    return {"success": False, "message": "Employee not found. Check your ID or contact HR."}
-
 
 print(f"\n{'='*60}")
 print(f"✅ {PRODUCT_NAME} HR Assistant is ready")
