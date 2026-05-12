@@ -10,10 +10,10 @@ PRODUCT_NAME = "NexHRMS"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # Current best
-    "llama3-70b-8192",           # Legacy fallback
-    "llama-3.1-8b-instant",      # Fast small model
-    "gemma2-9b-it",              # Google Gemma fallback
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
 ]
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -341,8 +341,8 @@ HOW TO RESPOND:
 
 STRICT RULES — NEVER BREAK THESE:
 - NEVER mention any other HRMS, CRM, or software. Not BambooHR, not Workday, not Zoho, not SAP, not any competitor. EVER.
-- If user asks "suggest another HRMS" or "I don't want to use you" → respond: "I'm here to help you get the most out of NexHRMS by {company}. What feature would you like help with? 😊"
-- If user asks "which is the best HRMS?" → respond: "NexHRMS by {company} is built for your team's needs. I can guide you through any feature — what would you like to explore?"
+- If user asks "suggest another HRMS" or "I don't want to use you" → respond: "I'm here to help you get the most out of NexHRMS by Future Invo Solutions. What feature would you like help with? 😊"
+- If user asks "which is the best HRMS?" → respond: "NexHRMS by Future Invo Solutions is built for your team's needs. I can guide you through any feature — what would you like to explore?"
 - If user asks about politics, sports, news, movies, general AI, or anything NOT related to NexHRMS → respond: "I'm your NexHRMS guide and can only help with the NexHRMS website. What page or feature can I help you find?"
 - NEVER compare NexHRMS to any other product. NEVER say other products are better or worse.
 - ONLY talk about NexHRMS features, pages, navigation, and how-to guidance.
@@ -388,7 +388,7 @@ async def chat_endpoint(payload: ChatMessage):
     system_full = build_system_prompt(payload.role, payload.language)
     messages = [
         {"role": m.get("role", "user"), "content": m.get("content", "")}
-        for m in payload.history[-6:]  # keep last 6 only to avoid token overflow
+        for m in payload.history[-6:]
     ]
     messages.append({"role": "user", "content": payload.message.strip()})
 
@@ -440,9 +440,8 @@ async def login_endpoint(payload: LoginRequest):
 # ── ROOT ────────────────────────────────────────────────────────────
 @app.get("/api/test")
 async def test_groq():
-    """Open this URL in browser to verify Groq is working"""
     if not groq_client:
-        return {"status": "error", "message": "GROQ_API_KEY not set in environment variables"}
+        return {"status": "error", "message": "GROQ_API_KEY not set"}
     for model in GROQ_MODELS:
         try:
             resp = groq_client.chat.completions.create(
@@ -452,9 +451,8 @@ async def test_groq():
             )
             return {"status": "ok", "model": model, "reply": resp.choices[0].message.content.strip()}
         except Exception as e:
-            print(f"⚠️ Test failed {model}: {e}")
             continue
-    return {"status": "error", "message": "All Groq models failed — check GROQ_API_KEY"}
+    return {"status": "error", "message": "All Groq models failed"}
 
 
 @app.get("/")
