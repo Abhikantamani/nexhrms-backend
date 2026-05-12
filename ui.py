@@ -10,8 +10,10 @@ PRODUCT_NAME = "NexHRMS"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",   # Current best
+    "llama3-70b-8192",           # Legacy fallback
+    "llama-3.1-8b-instant",      # Fast small model
+    "gemma2-9b-it",              # Google Gemma fallback
 ]
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -386,7 +388,7 @@ async def chat_endpoint(payload: ChatMessage):
     system_full = build_system_prompt(payload.role, payload.language)
     messages = [
         {"role": m.get("role", "user"), "content": m.get("content", "")}
-        for m in payload.history
+        for m in payload.history[-6:]  # keep last 6 only to avoid token overflow
     ]
     messages.append({"role": "user", "content": payload.message.strip()})
 
@@ -397,14 +399,16 @@ async def chat_endpoint(payload: ChatMessage):
                 messages=[{"role": "system", "content": system_full}] + messages,
                 max_tokens=500,
                 temperature=0.4,
+                timeout=30,
             )
             reply = resp.choices[0].message.content.strip()
-            print(f"✅ {model}")
+            print(f"✅ Groq OK — {model}")
             return {"response": reply}
         except Exception as e:
-            print(f"⚠️ {model}: {str(e)[:60]}")
+            print(f"⚠️ {model} failed: {str(e)[:80]}")
+            continue
 
-    return {"response": "I'm having trouble connecting right now. Please try again in a moment."}
+    return {"response": "I'm having trouble connecting right now. Please try again in a moment. 🔄"}
 
 
 # ── LOGIN ENDPOINT ──────────────────────────────────────────────────
@@ -434,6 +438,25 @@ async def login_endpoint(payload: LoginRequest):
 
 
 # ── ROOT ────────────────────────────────────────────────────────────
+@app.get("/api/test")
+async def test_groq():
+    """Open this URL in browser to verify Groq is working"""
+    if not groq_client:
+        return {"status": "error", "message": "GROQ_API_KEY not set in environment variables"}
+    for model in GROQ_MODELS:
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Say OK"}],
+                max_tokens=5,
+            )
+            return {"status": "ok", "model": model, "reply": resp.choices[0].message.content.strip()}
+        except Exception as e:
+            print(f"⚠️ Test failed {model}: {e}")
+            continue
+    return {"status": "error", "message": "All Groq models failed — check GROQ_API_KEY"}
+
+
 @app.get("/")
 async def root():
     return {
